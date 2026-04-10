@@ -1,5 +1,6 @@
-import io
 import os
+import cv2
+import numpy as np
 import torch
 from transformers import ViTForImageClassification, ViTImageProcessor
 from PIL import Image
@@ -172,16 +173,21 @@ def predict():
         return jsonify({"error": "No image provided"}), 400
 
     file = request.files["image"]
-    img = Image.open(io.BytesIO(file.read())).convert("RGB")
+    arr = np.frombuffer(file.read(), np.uint8)
+    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if bgr is None:
+        return jsonify({"error": "Could not decode image"}), 400
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    img = Image.fromarray(rgb)
     inputs = processor(images=img, return_tensors="pt")
 
     with torch.no_grad():
         outputs = model(**inputs)
         probs = torch.softmax(outputs.logits, dim=1)[0]
-        predicted_idx = torch.argmax(probs).item()
+        predicted_idx = int(torch.argmax(probs).item())
 
     label = model.config.id2label[predicted_idx]
-    confidence = round(probs[predicted_idx].item() * 100, 1)
+    confidence = round(float(probs[predicted_idx].item()) * 100, 1)
 
     return jsonify({"label": label, "confidence": confidence})
 

@@ -1,0 +1,9 @@
+flask
+torch
+torchvision
+transformers
+peft
+pillow
+kagglehub
+opencv-python
+numpy
