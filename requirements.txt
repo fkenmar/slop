@@ -2,7 +2,7 @@ flask
 torch
 torchvision
 transformers
-peft
+peft>=0.7.0
 pillow
 kagglehub
 opencv-python
@@ -10,3 +10,4 @@ numpy
 scikit-learn
 mediapipe
 matplotlib
+albumentations

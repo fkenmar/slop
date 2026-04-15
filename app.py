@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import cv2
 import numpy as np
 import torch
@@ -6,7 +7,8 @@ import mediapipe as mp
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.core.base_options import BaseOptions
 
-from transformers import ViTForImageClassification, ViTImageProcessor
+from transformers import CLIPVisionModel, CLIPImageProcessor
+from model import DeepfakeDetector, CLIP_MODEL_ID
 from PIL import Image
 from flask import Flask, request, jsonify, render_template_string
 
@@ -14,126 +16,186 @@ app = Flask(__name__)
 options = vision.FaceLandmarkerOptions(
     base_options=BaseOptions(model_asset_path="./model/face_landmarker.task"),
     running_mode=vision.RunningMode.IMAGE,
-    num_faces=1
+    num_faces=10
 )
 
 face_landmarker = vision.FaceLandmarker.create_from_options(options)
 
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-MODEL_ID = "./model" if os.path.exists("./model") else "prithivMLmods/Deep-Fake-Detector-v2-Model"
-print(f"Loading model from: {MODEL_ID}")
-processor = ViTImageProcessor.from_pretrained(MODEL_ID)
-model = ViTForImageClassification.from_pretrained(MODEL_ID)
+MODEL_DIR = Path("./model")
+if (MODEL_DIR / "clip_vision").exists():
+    print(f"Loading trained model from: {MODEL_DIR}")
+    model = DeepfakeDetector.from_pretrained(MODEL_DIR)
+    processor = CLIPImageProcessor.from_pretrained(MODEL_DIR)
+else:
+    print(f"No trained model found — loading base CLIP from {CLIP_MODEL_ID}")
+    clip_vision = CLIPVisionModel.from_pretrained(CLIP_MODEL_ID)
+    model = DeepfakeDetector(clip_vision)
+    processor = CLIPImageProcessor.from_pretrained(CLIP_MODEL_ID)
 model.eval()
 
-# ── MediaPipe Face Mesh ──────────────────────────────────────────────────────
-
-# ── Uncanny Valley Analysis ──────────────────────────────────────────────────
-def analyze_uncanny(bgr_img):
-    """Run uncanny valley heuristics on a BGR image. Returns dict of metrics."""
-    results = {}
+# ── Face Detection Helper ────────────────────────────────────────────────────
+def detect_faces(bgr_img):
+    """Detect all faces and return list of (landmarks, face_bbox).
+    face_bbox is (x1, y1, x2, y2) in pixel coords with padding.
+    Returns empty list if no faces found."""
     h, w = bgr_img.shape[:2]
     rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
-    gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
-
-    # --- 1. Facial Symmetry ---
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
     detection_result = face_landmarker.detect(mp_image)
-    if detection_result.face_landmarks:
-        landmarks = detection_result.face_landmarks[0]
-        # Wrap landmarks so we can access .x / .y by index
-        class _LM:
-            def __init__(self, lst):
-                self._lst = lst
-            def __getitem__(self, idx):
-                return self._lst[idx]
-        lm = _LM(landmarks)
 
-        # Compare left vs right side landmarks
-        # Left eye: 33, Right eye: 263, Nose tip: 1
-        pairs = [(33, 263), (133, 362), (70, 300), (105, 334), (107, 336)]
-        nose_x = lm[1].x
-        diffs = []
-        for li, ri in pairs:
-            left_dist = abs(lm[li].x - nose_x)
-            right_dist = abs(lm[ri].x - nose_x)
-            if max(left_dist, right_dist) > 0:
-                diffs.append(abs(left_dist - right_dist) / max(left_dist, right_dist))
-        symmetry = 1.0 - (sum(diffs) / len(diffs)) if diffs else 1.0
-        results["symmetry"] = round(symmetry * 100, 1)
+    if not detection_result.face_landmarks:
+        return []
 
-        # --- 2. Eye Reflection Consistency ---
-        # Extract left and right eye regions and compare their brightness histograms
-        def eye_region(indices):
-            pts = [(int(lm[i].x * w), int(lm[i].y * h)) for i in indices]
-            xs = [p[0] for p in pts]
-            ys = [p[1] for p in pts]
-            x1, x2 = max(0, min(xs)), min(w, max(xs))
-            y1, y2 = max(0, min(ys)), min(h, max(ys))
-            if x2 <= x1 or y2 <= y1:
-                return None
-            return gray[y1:y2, x1:x2]
+    faces = []
+    for landmarks in detection_result.face_landmarks:
+        xs = [lm.x * w for lm in landmarks]
+        ys = [lm.y * h for lm in landmarks]
+        x1, x2 = min(xs), max(xs)
+        y1, y2 = min(ys), max(ys)
+        fw, fh = x2 - x1, y2 - y1
+        pad_x, pad_y = fw * 0.2, fh * 0.2
+        x1 = int(max(0, x1 - pad_x))
+        y1 = int(max(0, y1 - pad_y))
+        x2 = int(min(w, x2 + pad_x))
+        y2 = int(min(h, y2 + pad_y))
+        faces.append((landmarks, (x1, y1, x2, y2)))
 
-        left_eye_idx = [33, 7, 163, 144, 145, 153, 154, 155, 133]
-        right_eye_idx = [362, 382, 381, 380, 374, 373, 390, 249, 263]
-        le = eye_region(left_eye_idx)
-        re = eye_region(right_eye_idx)
+    return faces
 
-        if le is not None and re is not None and le.size > 0 and re.size > 0:
-            le_resized = cv2.resize(le, (32, 16))
-            re_resized = cv2.resize(re, (32, 16))
-            # Compare histograms
-            h_left = cv2.calcHist([le_resized], [0], None, [32], [0, 256])
-            h_right = cv2.calcHist([re_resized], [0], None, [32], [0, 256])
-            cv2.normalize(h_left, h_left)
-            cv2.normalize(h_right, h_right)
-            eye_corr = cv2.compareHist(h_left, h_right, cv2.HISTCMP_CORREL)
-            results["eye_consistency"] = round(max(0, eye_corr) * 100, 1)
-        else:
-            results["eye_consistency"] = None
+
+def crop_face(bgr_img, bbox):
+    """Crop face region from image using bbox."""
+    x1, y1, x2, y2 = bbox
+    return bgr_img[y1:y2, x1:x2]
+
+
+# ── Uncanny Valley Analysis ──────────────────────────────────────────────────
+def analyze_uncanny(bgr_img, landmarks, face_bbox):
+    """Run uncanny valley heuristics on a BGR image using detected face region."""
+    results = {}
+    h, w = bgr_img.shape[:2]
+    gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
+
+    if landmarks is None or face_bbox is None:
+        return {"symmetry": None, "eye_consistency": None, "texture": None,
+                "edge_natural": None, "color_consistency": None}
+
+    lm = landmarks
+    fx1, fy1, fx2, fy2 = face_bbox
+    face_gray = gray[fy1:fy2, fx1:fx2]
+    face_bgr = bgr_img[fy1:fy2, fx1:fx2]
+
+    # --- 1. Facial Symmetry ---
+    pairs = [(33, 263), (133, 362), (70, 300), (105, 334), (107, 336)]
+    nose_x = lm[1].x
+    diffs = []
+    for li, ri in pairs:
+        left_dist = abs(lm[li].x - nose_x)
+        right_dist = abs(lm[ri].x - nose_x)
+        if max(left_dist, right_dist) > 0:
+            diffs.append(abs(left_dist - right_dist) / max(left_dist, right_dist))
+    symmetry = 1.0 - (sum(diffs) / len(diffs)) if diffs else 1.0
+    results["symmetry"] = round(symmetry * 100, 1)
+
+    # --- 2. Eye Reflection Consistency ---
+    def eye_region(indices):
+        pts = [(int(lm[i].x * w), int(lm[i].y * h)) for i in indices]
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        x1, x2 = max(0, min(xs)), min(w, max(xs))
+        y1, y2 = max(0, min(ys)), min(h, max(ys))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return gray[y1:y2, x1:x2]
+
+    left_eye_idx = [33, 7, 163, 144, 145, 153, 154, 155, 133]
+    right_eye_idx = [362, 382, 381, 380, 374, 373, 390, 249, 263]
+    le = eye_region(left_eye_idx)
+    re = eye_region(right_eye_idx)
+
+    if le is not None and re is not None and le.size > 0 and re.size > 0:
+        le_resized = cv2.resize(le, (32, 16))
+        re_resized = cv2.resize(re, (32, 16))
+        h_left = cv2.calcHist([le_resized], [0], None, [32], [0, 256])
+        h_right = cv2.calcHist([re_resized], [0], None, [32], [0, 256])
+        cv2.normalize(h_left, h_left)
+        cv2.normalize(h_right, h_right)
+        eye_corr = cv2.compareHist(h_left, h_right, cv2.HISTCMP_CORREL)
+        results["eye_consistency"] = round(max(0, eye_corr) * 100, 1)
     else:
-        results["symmetry"] = None
         results["eye_consistency"] = None
 
-    # --- 3. Skin Texture (FFT frequency analysis) ---
-    # Real skin has more high-frequency micro-texture; deepfakes are smoother
-    gray_f = np.float32(gray)
-    dft = cv2.dft(gray_f, flags=cv2.DFT_COMPLEX_OUTPUT)
+    # --- 3. Skin Texture (FFT on face region only) ---
+    face_gray_f = np.float32(face_gray)
+    dft = cv2.dft(face_gray_f, flags=cv2.DFT_COMPLEX_OUTPUT)
     dft_shift = np.fft.fftshift(dft)
     magnitude = cv2.magnitude(dft_shift[:, :, 0], dft_shift[:, :, 1])
     magnitude = np.log(magnitude + 1)
 
-    # Ratio of high-freq to total energy
-    cy, cx = h // 2, w // 2
+    fh, fw = face_gray.shape[:2]
+    cy, cx = fh // 2, fw // 2
     radius = min(cy, cx) // 3
     total_energy = magnitude.sum()
-    # Mask out center (low freq)
     mask = np.ones_like(magnitude)
     cv2.circle(mask, (cx, cy), radius, 0, -1)
     high_freq_energy = (magnitude * mask).sum()
     texture_score = high_freq_energy / total_energy if total_energy > 0 else 0
-    # Normalize to 0-100 range (empirically tuned)
     results["texture"] = round(min(texture_score * 130, 100), 1)
 
-    # --- 4. Edge Artifacts (Laplacian variance along face boundary) ---
-    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
-    lap_var = laplacian.var()
-    # Higher variance = more natural edges; low = over-smoothed blending
-    # Normalize: typical range 100-3000
+    # --- 4. Edge Artifacts (Laplacian on face boundary region) ---
+    # Create a ring mask around the face edge to check blending artifacts
+    face_h, face_w = face_gray.shape[:2]
+    ring_mask = np.zeros_like(face_gray)
+    center = (face_w // 2, face_h // 2)
+    outer_r = min(face_w, face_h) // 2
+    inner_r = int(outer_r * 0.75)
+    cv2.circle(ring_mask, center, outer_r, 255, -1)
+    cv2.circle(ring_mask, center, inner_r, 0, -1)
+
+    laplacian = cv2.Laplacian(face_gray, cv2.CV_64F)
+    edge_pixels = laplacian[ring_mask > 0]
+    lap_var = edge_pixels.var() if edge_pixels.size > 0 else 0
     edge_score = min(lap_var / 20, 100)
     results["edge_natural"] = round(edge_score, 1)
 
-    # --- 5. Color Consistency (check lighting direction via face halves) ---
-    left_half = bgr_img[:, :w // 2]
-    right_half = bgr_img[:, w // 2:]
+    # --- 5. Lighting Consistency (face halves only) ---
+    face_mid = face_w // 2
+    left_half = face_bgr[:, :face_mid]
+    right_half = face_bgr[:, face_mid:]
     left_mean = np.mean(left_half, axis=(0, 1))
     right_mean = np.mean(right_half, axis=(0, 1))
-    # Compare color channel ratios between halves
     color_diff = np.abs(left_mean - right_mean)
-    # Normalize: small diff = consistent lighting
     color_consistency = max(0, 100 - np.mean(color_diff) * 2)
     results["color_consistency"] = round(color_consistency, 1)
+
+    # --- 6. Noise Pattern Analysis ---
+    # Real photos have natural sensor noise; AI-generated images have uniform/no noise.
+    # Extract noise by subtracting a blurred version from the original face.
+    denoised = cv2.GaussianBlur(face_gray, (5, 5), 0)
+    noise = face_gray.astype(np.float64) - denoised.astype(np.float64)
+
+    # Real noise has higher variance and non-uniform distribution across the face
+    noise_std = noise.std()
+
+    # Check noise uniformity — split face into 4 quadrants and compare noise levels
+    mid_y, mid_x = face_gray.shape[0] // 2, face_gray.shape[1] // 2
+    quadrants = [
+        noise[:mid_y, :mid_x], noise[:mid_y, mid_x:],
+        noise[mid_y:, :mid_x], noise[mid_y:, mid_x:],
+    ]
+    quad_stds = [q.std() for q in quadrants if q.size > 0]
+    # Low variation between quadrants = suspiciously uniform (AI-generated)
+    # High variation = natural sensor noise affected by lighting/skin
+    noise_variation = np.std(quad_stds) if len(quad_stds) > 1 else 0
+
+    # Combine: real images score high on both noise presence and non-uniformity
+    # noise_std typical range: 2-15 for real, 0-3 for AI
+    presence_score = min(noise_std / 10 * 100, 100)
+    uniformity_score = min(noise_variation / 2 * 100, 100)
+    noise_score = presence_score * 0.6 + uniformity_score * 0.4
+    results["noise_natural"] = round(min(noise_score, 100), 1)
 
     return results
 
@@ -308,11 +370,22 @@ HTML = """
     }
     .badge.realism { background: #0a2618; color: #4caf82; }
     .badge.deepfake { background: #2a0a0a; color: #e05c5c; }
+
+    .face-results { display: flex; flex-direction: column; gap: 12px; width: 100%; }
+    .face-result {
+      padding: 16px;
+      border-radius: 14px;
+      animation: fadeIn 0.3s ease;
+    }
+    .face-result.realism { background: #0a2618; border: 1px solid #1a4a32; }
+    .face-result.deepfake { background: #2a0a0a; border: 1px solid #4a1a1a; }
+    .face-header { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+    .face-label { font-size: 0.75rem; color: #888; background: #1a1a1a; padding: 2px 8px; border-radius: 6px; }
   </style>
 </head>
 <body>
   <h1>Deepfake Detector</h1>
-  <p class="sub">Upload a face image to check if it's real or AI-generated</p>
+  <p class="sub">Upload an image to check if faces are real or AI-generated</p>
   <div class="card">
     <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
       <div class="icon">+</div>
@@ -323,15 +396,7 @@ HTML = """
       <button class="btn-secondary" id="clearBtn" onclick="clearImage()" disabled>Clear</button>
       <button id="analyzeBtn" onclick="analyze()" disabled>Analyze</button>
     </div>
-    <div class="result" id="result">
-      <div class="verdict" id="verdict"></div>
-      <div class="conf-bar-wrap"><div class="conf-bar" id="confBar"></div></div>
-      <div class="conf-text" id="confidence"></div>
-      <div class="analysis" id="analysis">
-        <h4>Uncanny Valley Analysis</h4>
-        <div id="metrics"></div>
-      </div>
-    </div>
+    <div id="resultsContainer"></div>
   </div>
 
   <div class="history" id="historySection" style="display:none">
@@ -391,25 +456,53 @@ HTML = """
       try {
         const res = await fetch('/predict', { method: 'POST', body: form });
         const data = await res.json();
+        const container = document.getElementById('resultsContainer');
+        container.innerHTML = '';
 
-        const resultEl = document.getElementById('result');
-        const cls = data.label.toLowerCase();
-        resultEl.className = 'result ' + cls;
+        if (!data.face_detected) {
+          const face = data.faces[0];
+          const cls = face.label.toLowerCase();
+          container.innerHTML =
+            '<div class="face-result deepfake">' +
+              '<div class="verdict">NO FACE DETECTED</div>' +
+              '<div class="conf-text">Upload a clear, front-facing photo for accurate results</div>' +
+            '</div>';
+          btn.disabled = false;
+          btn.textContent = 'Analyze';
+          return;
+        }
 
-        document.getElementById('verdict').textContent =
-          cls === 'realism' ? 'REAL IMAGE' : 'DEEPFAKE DETECTED';
+        const faceCount = data.faces.length;
+        data.faces.forEach((face, i) => {
+          const cls = face.label.toLowerCase();
+          const verdictText = cls === 'realism' ? 'REAL' : 'DEEPFAKE';
+          const faceLabel = faceCount > 1 ? 'Face ' + (i + 1) : '';
 
-        const bar = document.getElementById('confBar');
-        bar.style.width = '0%';
-        setTimeout(() => { bar.style.width = data.confidence + '%'; }, 50);
+          const div = document.createElement('div');
+          div.className = 'face-result ' + cls;
+          div.innerHTML =
+            '<div class="face-header">' +
+              (faceLabel ? '<span class="face-label">' + faceLabel + '</span>' : '') +
+              '<div class="verdict">' + verdictText + '</div>' +
+            '</div>' +
+            '<div class="conf-bar-wrap"><div class="conf-bar" style="width:0%"></div></div>' +
+            '<div class="conf-text">' + face.confidence + '% confidence</div>' +
+            '<div class="analysis" style="display:block; margin-top:8px;">' +
+              '<h4>Uncanny Valley Analysis</h4>' +
+              '<div class="metrics-container"></div>' +
+            '</div>';
+          container.appendChild(div);
 
-        document.getElementById('confidence').textContent = data.confidence + '% confidence';
-        resultEl.style.display = 'block';
+          // Animate confidence bar
+          setTimeout(() => {
+            div.querySelector('.conf-bar').style.width = face.confidence + '%';
+          }, 50);
 
-        // Render uncanny valley metrics
-        renderMetrics(data.uncanny);
+          // Render uncanny metrics
+          renderMetricsInto(div.querySelector('.metrics-container'), face.uncanny);
 
-        addHistory(selectedFile.name, cls, data.confidence, thumbData);
+          addHistory(selectedFile.name + (faceLabel ? ' (' + faceLabel + ')' : ''), cls, face.confidence, thumbData);
+        });
       } catch (err) {
         alert('Analysis failed: ' + err.message);
       }
@@ -424,14 +517,12 @@ HTML = """
       texture:           { label: 'Skin Texture',        desc: 'Presence of natural micro-texture (FFT analysis)' },
       edge_natural:      { label: 'Edge Naturalness',    desc: 'Quality of edges around facial boundaries' },
       color_consistency: { label: 'Lighting Consistency', desc: 'Whether lighting is uniform across the face' },
+      noise_natural:     { label: 'Noise Pattern',        desc: 'Presence of natural camera sensor noise (AI images lack this)' },
     };
 
-    function renderMetrics(uncanny) {
-      const container = document.getElementById('metrics');
-      const panel = document.getElementById('analysis');
+    function renderMetricsInto(container, uncanny) {
       container.innerHTML = '';
-      if (!uncanny) { panel.style.display = 'none'; return; }
-      panel.style.display = 'block';
+      if (!uncanny) return;
 
       for (const [key, info] of Object.entries(metricInfo)) {
         const val = uncanny[key];
@@ -448,7 +539,6 @@ HTML = """
           '<div class="metric-desc">' + info.desc + '</div>';
         container.appendChild(row);
 
-        // Animate bar
         setTimeout(() => {
           row.querySelector('.metric-bar').style.width = val + '%';
         }, 100);
@@ -488,25 +578,59 @@ def predict():
     bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if bgr is None:
         return jsonify({"error": "Could not decode image"}), 400
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    img = Image.fromarray(rgb)
-    inputs = processor(images=img, return_tensors="pt")
 
-    with torch.no_grad():
-        outputs = model(**inputs)
-        probs = torch.softmax(outputs.logits, dim=1)[0]
-        predicted_idx = int(torch.argmax(probs).item())
+    faces = detect_faces(bgr)
 
-    label = model.config.id2label[predicted_idx]
-    confidence = round(float(probs[predicted_idx].item()) * 100, 1)
+    if not faces:
+        # No face detected — fall back to full image as single result
+        face_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(face_rgb)
+        inputs = processor(images=img, return_tensors="pt")
 
-    # Uncanny valley analysis
-    uncanny = analyze_uncanny(bgr)
+        with torch.no_grad():
+            outputs = model(**inputs)
+            probs = torch.softmax(outputs.logits, dim=1)[0]
+            predicted_idx = int(torch.argmax(probs).item())
+
+        return jsonify({
+            "faces": [{
+                "label": model.id2label[predicted_idx],
+                "confidence": round(float(probs[predicted_idx].item()) * 100, 1),
+                "uncanny": analyze_uncanny(bgr, None, None),
+                "bbox": None,
+            }],
+            "face_count": 0,
+            "face_detected": False,
+        })
+
+    # Process each detected face
+    results = []
+    for landmarks, face_bbox in faces:
+        face_bgr = crop_face(bgr, face_bbox)
+        face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(face_rgb)
+        inputs = processor(images=img, return_tensors="pt")
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+            probs = torch.softmax(outputs.logits, dim=1)[0]
+            predicted_idx = int(torch.argmax(probs).item())
+
+        label = model.id2label[predicted_idx]
+        confidence = round(float(probs[predicted_idx].item()) * 100, 1)
+        uncanny = analyze_uncanny(bgr, landmarks, face_bbox)
+
+        results.append({
+            "label": label,
+            "confidence": confidence,
+            "uncanny": uncanny,
+            "bbox": list(face_bbox),
+        })
 
     return jsonify({
-        "label": label,
-        "confidence": confidence,
-        "uncanny": uncanny,
+        "faces": results,
+        "face_count": len(results),
+        "face_detected": True,
     })
 
 if __name__ == "__main__":
