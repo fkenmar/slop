@@ -12,6 +12,7 @@ Runs three evaluation modes:
 Uses Test-Time Augmentation (TTA): averages original + flipped predictions.
 """
 
+import os
 from pathlib import Path
 from torch.utils.data import DataLoader, ConcatDataset
 from torchvision.datasets import ImageFolder
@@ -24,6 +25,7 @@ from sklearn.metrics import (
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+
 
 MODEL_DIR  = Path("./model")
 DATASET_1  = Path("/Users/kenmarfrancisco/.cache/kagglehub/datasets/manjilkarki/deepfake-and-real-images/versions/1/Dataset")

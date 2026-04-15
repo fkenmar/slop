@@ -1,18 +1,26 @@
 import os
+import base64
+import io
 from pathlib import Path
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 import mediapipe as mp
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.core.base_options import BaseOptions
 
+import contextlib
 from transformers import CLIPVisionModel, CLIPImageProcessor
+from transformers.models.clip.modeling_clip import CLIPAttention
 from model import DeepfakeDetector, CLIP_MODEL_ID
 from PIL import Image
 from flask import Flask, request, jsonify, render_template_string
+from flask_cors import CORS
+
 
 app = Flask(__name__)
+CORS(app, origins="*")
 options = vision.FaceLandmarkerOptions(
     base_options=BaseOptions(model_asset_path="./model/face_landmarker.task"),
     running_mode=vision.RunningMode.IMAGE,
@@ -563,6 +571,93 @@ HTML = """
 </html>
 """
 
+# ── Attention Map ─────────────────────────────────────────────────────────────
+def generate_attention_map(pixel_values):
+    """Generate an attention heatmap using CLIP's self-attention weights.
+
+    Uses attention rollout: multiplies attention matrices across all layers
+    to show which input patches influence the final CLS token representation.
+    Works with frozen/adapter models since it reads attention weights directly.
+    Returns a base64-encoded PNG heatmap.
+    """
+    with torch.no_grad():
+        # Get attention weights from all layers
+        clip = model.clip_vision
+        try:
+            vision_model = clip.base_model.model.vision_model
+        except AttributeError:
+            vision_model = clip.vision_model
+
+        # sdpa attention ignores output_attentions=True; patch each layer's forward
+        # to use the parent CLIPAttention (eager) implementation so weights are returned.
+        patched = []
+        for layer in vision_model.encoder.layers:
+            attn = layer.self_attn
+            if type(attn) is not CLIPAttention:
+                # PyTorch __call__ ignores instance-level 'forward' patches.
+                # Since CLIPSdpaAttention subclasses CLIPAttention, we temporarily 
+                # change the class to invoke the parent's eager forward pass.
+                orig_class = attn.__class__
+                attn.__class__ = CLIPAttention
+                patched.append((attn, orig_class))
+        try:
+            vision_out = vision_model(pixel_values=pixel_values, output_attentions=True)
+        finally:
+            for attn, orig_class in patched:
+                attn.__class__ = orig_class
+        attentions = vision_out.attentions  # tuple of [B, heads, tokens, tokens]
+
+        if not attentions:
+            return None
+
+        # Attention rollout — multiply attention matrices across layers
+        # Average over heads first, then chain-multiply
+        rollout = None
+        for attn in attentions:
+            # attn: [B, heads, tokens, tokens]
+            attn_heads_mean = attn[0].mean(dim=0)  # [tokens, tokens]
+
+            # Add residual connection (identity)
+            attn_heads_mean = 0.5 * attn_heads_mean + 0.5 * torch.eye(
+                attn_heads_mean.size(0), device=attn_heads_mean.device
+            )
+
+            # Re-normalize rows
+            attn_heads_mean = attn_heads_mean / attn_heads_mean.sum(dim=-1, keepdim=True)
+
+            if rollout is None:
+                rollout = attn_heads_mean
+            else:
+                rollout = rollout @ attn_heads_mean
+
+        # Extract CLS token's attention to all spatial patches
+        # CLS is token 0, spatial patches are tokens 1:
+        cls_attention = rollout[0, 1:]  # [num_patches]
+
+        num_patches = cls_attention.shape[0]
+        grid_size = int(num_patches ** 0.5)
+
+        # Reshape to spatial grid
+        cam = cls_attention.reshape(grid_size, grid_size)
+
+        # Normalize to [0, 1]
+        cam = cam - cam.min()
+        if cam.max() > 0:
+            cam = cam / cam.max()
+
+        # Upscale and apply colormap
+        cam_np = cam.cpu().numpy()
+        cam_resized = cv2.resize(cam_np, (224, 224))
+        heatmap = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
+        heatmap_rgb = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+
+        # Encode as base64 PNG
+        img = Image.fromarray(heatmap_rgb)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
@@ -592,12 +687,15 @@ def predict():
             probs = torch.softmax(outputs.logits, dim=1)[0]
             predicted_idx = int(torch.argmax(probs).item())
 
+        gradcam = generate_attention_map(inputs["pixel_values"])
+
         return jsonify({
             "faces": [{
                 "label": model.id2label[predicted_idx],
                 "confidence": round(float(probs[predicted_idx].item()) * 100, 1),
                 "uncanny": analyze_uncanny(bgr, None, None),
                 "bbox": None,
+                "gradcam": gradcam,
             }],
             "face_count": 0,
             "face_detected": False,
@@ -619,12 +717,14 @@ def predict():
         label = model.id2label[predicted_idx]
         confidence = round(float(probs[predicted_idx].item()) * 100, 1)
         uncanny = analyze_uncanny(bgr, landmarks, face_bbox)
+        gradcam = generate_attention_map(inputs["pixel_values"])
 
         results.append({
             "label": label,
             "confidence": confidence,
             "uncanny": uncanny,
             "bbox": list(face_bbox),
+            "gradcam": gradcam,
         })
 
     return jsonify({
@@ -634,4 +734,4 @@ def predict():
     })
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, port=5001)

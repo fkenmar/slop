@@ -20,6 +20,8 @@ Training:
 Saves the merged model to ./model/ for use in app.py.
 """
 
+import os
+import multiprocessing
 from pathlib import Path
 from torch.utils.data import DataLoader, ConcatDataset, Sampler
 from torchvision.datasets import ImageFolder
@@ -35,6 +37,8 @@ import numpy as np
 import cv2
 import albumentations as A
 import matplotlib.pyplot as plt
+from tqdm import tqdm
+
 
 
 # ── Balanced Batch Sampler ────────────────────────────────────────────────────
@@ -151,8 +155,8 @@ DATASET_1       = Path("/Users/kenmarfrancisco/.cache/kagglehub/datasets/manjilk
 DATASET_2       = Path("/Users/kenmarfrancisco/.cache/kagglehub/datasets/xhlulu/140k-real-and-fake-faces/versions/2/real_vs_fake/real-vs-fake")
 SAVE_DIR        = Path("./model")
 EPOCHS          = 15
-BATCH_SIZE      = 32
-ACCUM_STEPS     = 2       # effective batch size = 32 * 2 = 64
+BATCH_SIZE      = 64
+ACCUM_STEPS     = 1       # effective batch size = 64
 LR              = 2e-4
 PATIENCE        = 3       # early stop after 3 epochs without improvement
 LABEL_SMOOTHING = 0.1     # prevents overconfident predictions on CE component
@@ -278,7 +282,12 @@ def val_transform(img):
 
 
 if __name__ == "__main__":
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"Using device: {device}")
 
     # ── Datasets ──────────────────────────────────────────────────────────────
@@ -333,8 +342,12 @@ if __name__ == "__main__":
     print(f"  Per-group per batch: {BATCH_SIZE // 4} (batch_size={BATCH_SIZE}, 4 groups)")
 
     balanced_sampler = BalancedBatchSampler(group_indices, batch_size=BATCH_SIZE)
-    train_loader = DataLoader(train_ds, batch_sampler=balanced_sampler, num_workers=4, persistent_workers=True, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=4, persistent_workers=True, pin_memory=True)
+    if device.type == "cuda":
+        num_workers, pin_memory = 4, True
+    else:
+        num_workers, pin_memory = 0, False
+    train_loader = DataLoader(train_ds, batch_sampler=balanced_sampler, num_workers=num_workers, pin_memory=pin_memory)
+    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
 
     # ── Model ─────────────────────────────────────────────────────────────────
     dora_checkpoint = SAVE_DIR / "dora"
@@ -344,14 +357,17 @@ if __name__ == "__main__":
     if resuming:
         print(f"Resuming from saved DoRA weights at {dora_checkpoint}")
         from peft import PeftModel
+        print("Loading base CLIP model...")
         clip_vision = CLIPVisionModel.from_pretrained(CLIP_MODEL_ID)
+        print("Loading DoRA adapter weights...")
         clip_vision = PeftModel.from_pretrained(clip_vision, dora_checkpoint, is_trainable=True)
         model = DeepfakeDetector(clip_vision)
+        print("Loading head weights...")
         head_data = torch.load(head_checkpoint, map_location=device, weights_only=True)
         model.fft_branch.load_state_dict(head_data["fft_branch"])
         model.classifier.load_state_dict(head_data["classifier"])
     else:
-        print(f"Starting training from {CLIP_MODEL_ID}")
+        print(f"Downloading/loading {CLIP_MODEL_ID} (this may take a moment)...")
         clip_vision = CLIPVisionModel.from_pretrained(CLIP_MODEL_ID)
 
         # DoRA on ALL attention layers (including early layers for frequency cues).
@@ -442,10 +458,12 @@ if __name__ == "__main__":
         total_loss, correct, total = 0.0, 0, 0
         optimizer.zero_grad()
 
-        for step, (pixels, labels) in enumerate(train_loader):
+        pbar = tqdm(enumerate(train_loader), total=len(train_loader),
+                    desc=f"Epoch {epoch+1}/{EPOCHS} [train]", unit="batch")
+        for step, (pixels, labels) in pbar:
             pixels, labels = pixels.to(device), labels.to(device)
 
-            with torch.autocast(device_type="mps", dtype=torch.float16):
+            with torch.autocast(device_type=device.type, dtype=torch.float16):
                 outputs = model(pixel_values=pixels, return_fused=True)
 
                 # CE loss on classification logits
@@ -471,10 +489,9 @@ if __name__ == "__main__":
             correct += (preds == labels).sum().item()
             total += labels.size(0)
 
-            if (step + 1) % 200 == 0:
-                lr_now = optimizer.param_groups[0]["lr"]
-                print(f"  Epoch {epoch+1} | Step {step+1}/{len(train_loader)} | "
-                      f"Loss: {total_loss/(step+1):.4f} | Acc: {correct/total:.4f} | LR: {lr_now:.2e}")
+            pbar.set_postfix(loss=f"{total_loss/(step+1):.4f}",
+                             acc=f"{correct/total:.4f}",
+                             lr=f"{optimizer.param_groups[0]['lr']:.2e}")
 
         train_acc = correct / total
         train_loss_avg = total_loss / len(train_loader)
@@ -487,9 +504,9 @@ if __name__ == "__main__":
         val_all_probs, val_all_labels = [], []
         val_loss_sum = 0.0
         with torch.no_grad():
-            for pixels, labels in val_loader:
+            for pixels, labels in tqdm(val_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [val]", unit="batch"):
                 pixels, labels = pixels.to(device), labels.to(device)
-                with torch.autocast(device_type="mps", dtype=torch.float16):
+                with torch.autocast(device_type=device.type, dtype=torch.float16):
                     outputs = model(pixel_values=pixels)
                     val_loss = ce_criterion(outputs.logits, labels)
                 val_loss_sum += val_loss.item()
@@ -512,14 +529,6 @@ if __name__ == "__main__":
               f"Train Acc: {train_acc:.4f} | Val AUC: {val_auc:.4f} | Val Acc: {val_acc:.4f}")
 
         # ── Save training state every epoch (for safe resume) ────────────────
-        torch.save({
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "epoch": epoch,
-            "best_val_auc": best_val_auc,
-            "patience_counter": patience_counter,
-        }, SAVE_DIR / "train_state.pt")
-
         # ── Save best + versioned snapshots + early stopping ─────────────────
         if val_auc > best_val_auc:
             best_val_auc = val_auc
@@ -533,10 +542,7 @@ if __name__ == "__main__":
                 "id2label": model.id2label,
                 "projection_head": projection_head.state_dict(),
             }, SAVE_DIR / "head_weights.pt")
-            # Versioned snapshot for rollback
-            snapshot_dir = SAVE_DIR / f"dora_epoch{epoch+1}_auc{val_auc:.4f}"
-            model.clip_vision.save_pretrained(snapshot_dir)
-            # Update train_state with new best
+            # Save optimizer/scheduler state in sync with best weights
             torch.save({
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
@@ -544,6 +550,9 @@ if __name__ == "__main__":
                 "best_val_auc": best_val_auc,
                 "patience_counter": patience_counter,
             }, SAVE_DIR / "train_state.pt")
+            # Versioned snapshot for rollback
+            snapshot_dir = SAVE_DIR / f"dora_epoch{epoch+1}_auc{val_auc:.4f}"
+            model.clip_vision.save_pretrained(snapshot_dir)
             print(f"  Saved best DoRA weights (val_auc={val_auc:.4f})")
             print(f"  Snapshot: {snapshot_dir.name}")
         else:

@@ -11,3 +11,5 @@ scikit-learn
 mediapipe
 matplotlib
 albumentations
+tqdm
+flask-cors
