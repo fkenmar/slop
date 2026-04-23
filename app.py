@@ -17,7 +17,9 @@ from model import DeepfakeDetector, CLIP_MODEL_ID
 from PIL import Image
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
+from dotenv import load_dotenv
 
+load_dotenv()
 
 app = Flask(__name__)
 CORS(app, origins="*")

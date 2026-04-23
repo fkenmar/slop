@@ -24,6 +24,7 @@ env/
 # Environment variables
 .env
 .env.*
+!.env.example
 
 # macOS
 .DS_Store
@@ -31,6 +32,10 @@ env/
 # IDE
 .vscode/
 .idea/
+.claude/
+
+# Credentials / local config
+.kaggle/
 
 # Logs
 *.log

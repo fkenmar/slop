@@ -38,7 +38,9 @@ import cv2
 import albumentations as A
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+from dotenv import load_dotenv
 
+load_dotenv()
 
 
 # ── Balanced Batch Sampler ────────────────────────────────────────────────────

@@ -13,3 +13,4 @@ matplotlib
 albumentations
 tqdm
 flask-cors
+python-dotenv
