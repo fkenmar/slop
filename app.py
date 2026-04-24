@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import mediapipe as mp
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.core.base_options import BaseOptions
+from ultralytics import YOLO
 
 import contextlib
 from transformers import CLIPVisionModel, CLIPImageProcessor
@@ -25,10 +26,22 @@ CORS(app, origins="*")
 options = vision.FaceLandmarkerOptions(
     base_options=BaseOptions(model_asset_path="./model/face_landmarker.task"),
     running_mode=vision.RunningMode.IMAGE,
-    num_faces=10
+    num_faces=1,
+    min_face_detection_confidence=0.3,
+    min_face_presence_confidence=0.3,
 )
 
 face_landmarker = vision.FaceLandmarker.create_from_options(options)
+
+YOLO_FACE_PATH = "./model/yolov8n-face.pt"
+YOLO_FACE_CONF = 0.35
+yolo_face = YOLO(YOLO_FACE_PATH)
+
+
+class _Landmark:
+    __slots__ = ("x", "y", "z")
+    def __init__(self, x, y, z=0.0):
+        self.x, self.y, self.z = x, y, z
 
 
 # ── Model ─────────────────────────────────────────────────────────────────────
@@ -46,30 +59,46 @@ model.eval()
 
 # ── Face Detection Helper ────────────────────────────────────────────────────
 def detect_faces(bgr_img):
-    """Detect all faces and return list of (landmarks, face_bbox).
-    face_bbox is (x1, y1, x2, y2) in pixel coords with padding.
-    Returns empty list if no faces found."""
+    """Detect faces with YOLOv8-face, then fit landmarks per-crop with MediaPipe.
+    Returns list of (landmarks_in_full_image_norm_coords_or_None, (x1,y1,x2,y2) pixels)."""
     h, w = bgr_img.shape[:2]
     rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-    detection_result = face_landmarker.detect(mp_image)
 
-    if not detection_result.face_landmarks:
+    results = yolo_face.predict(bgr_img, conf=YOLO_FACE_CONF, verbose=False)
+    boxes = []
+    if results and len(results) > 0 and results[0].boxes is not None:
+        for xyxy in results[0].boxes.xyxy.cpu().numpy():
+            boxes.append(tuple(xyxy.tolist()))
+    print(f"[detect_faces] YOLOv8 returned {len(boxes)} face(s)")
+    if not boxes:
         return []
 
     faces = []
-    for landmarks in detection_result.face_landmarks:
-        xs = [lm.x * w for lm in landmarks]
-        ys = [lm.y * h for lm in landmarks]
-        x1, x2 = min(xs), max(xs)
-        y1, y2 = min(ys), max(ys)
-        fw, fh = x2 - x1, y2 - y1
-        pad_x, pad_y = fw * 0.2, fh * 0.2
-        x1 = int(max(0, x1 - pad_x))
-        y1 = int(max(0, y1 - pad_y))
-        x2 = int(min(w, x2 + pad_x))
-        y2 = int(min(h, y2 + pad_y))
-        faces.append((landmarks, (x1, y1, x2, y2)))
+    for bx1, by1, bx2, by2 in boxes:
+        bw = bx2 - bx1
+        bh = by2 - by1
+        pad_x = bw * 0.2
+        pad_y = bh * 0.2
+        x1 = int(max(0, bx1 - pad_x))
+        y1 = int(max(0, by1 - pad_y))
+        x2 = int(min(w, bx2 + pad_x))
+        y2 = int(min(h, by2 + pad_y))
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        crop_rgb = rgb[y1:y2, x1:x2]
+        cw, ch = x2 - x1, y2 - y1
+        mp_crop = mp.Image(image_format=mp.ImageFormat.SRGB, data=crop_rgb)
+        lm_result = face_landmarker.detect(mp_crop)
+        if lm_result.face_landmarks:
+            crop_lms = lm_result.face_landmarks[0]
+            remapped = [
+                _Landmark((p.x * cw + x1) / w, (p.y * ch + y1) / h, p.z)
+                for p in crop_lms
+            ]
+        else:
+            remapped = None
+        faces.append((remapped, (x1, y1, x2, y2)))
 
     return faces
 

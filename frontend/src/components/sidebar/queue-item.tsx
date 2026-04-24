@@ -14,11 +14,19 @@ export function QueueItem({ job, isActive }: QueueItemProps) {
   const { setActiveJob, retryJob, removeJob } = useQueueStore();
 
   return (
-    <button
+    <div
+      role="button"
+      tabIndex={0}
       onClick={() => setActiveJob(job.id)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          setActiveJob(job.id);
+        }
+      }}
       className={cn(
-        "w-full text-left p-3 border-b border-border-muted transition-colors",
-        "hover:bg-surface-sunken/50",
+        "w-full text-left p-3 border-b border-border-muted transition-colors cursor-pointer",
+        "hover:bg-surface-sunken/50 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary",
         isActive && "bg-accent-subtle/40 border-l-2 border-l-primary"
       )}
     >
@@ -110,6 +118,6 @@ export function QueueItem({ job, isActive }: QueueItemProps) {
           </button>
         )}
       </div>
-    </button>
+    </div>
   );
 }

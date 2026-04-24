@@ -14,3 +14,4 @@ albumentations
 tqdm
 flask-cors
 python-dotenv
+ultralytics
