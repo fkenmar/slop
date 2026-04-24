@@ -25,9 +25,8 @@ from sklearn.metrics import (
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from dotenv import load_dotenv
 
-load_dotenv()
+from dotenv import load_dotenv; load_dotenv()
 
 MODEL_DIR  = Path("./model")
 DATASET_1  = Path("/Users/kenmarfrancisco/.cache/kagglehub/datasets/manjilkarki/deepfake-and-real-images/versions/1/Dataset")

@@ -1,7 +1,3 @@
-# Progress
-
-Still training on different varieties of output, currently training for images produced by diffusion models like Dall-E and Nano Banana 2. With the release of GPT Image 2 we might be able to have better training data
-
 # Deepfake Detector
 
 An image-based deepfake detection web app that classifies face images as **Real** or **Deepfake** using a two-branch fusion model: a DoRA-fine-tuned CLIP ViT-L/14 backbone (spatial features) combined with a lightweight CNN over the 2D FFT magnitude spectrum (frequency artifacts). A Flask backend serves predictions, attention-rollout heatmaps, and uncanny-valley heuristics; a React/Vite frontend provides the UI.
