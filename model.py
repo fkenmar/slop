@@ -105,13 +105,29 @@ class DeepfakeDetector(nn.Module):
         }, save_dir / "head_weights.pt")
 
     @classmethod
-    def from_pretrained(cls, save_dir, device="cpu"):
-        """Load a trained model for inference."""
-        save_dir = Path(save_dir)
-        clip_vision = CLIPVisionModel.from_pretrained(save_dir / "clip_vision")
-        head_data = torch.load(
-            save_dir / "head_weights.pt", map_location=device, weights_only=True
-        )
+    def from_pretrained(cls, model_id_or_path, device="cpu"):
+        """Load a trained model for inference.
+
+        Accepts either a local directory path or a Hugging Face repo ID.
+        When loading from HF, the CLIP backbone is pulled from openai/clip-vit-large-patch14.
+        """
+        local = Path(model_id_or_path)
+        if local.exists():
+            clip_dir = local / "clip_vision"
+            clip_vision = CLIPVisionModel.from_pretrained(
+                str(clip_dir) if clip_dir.exists() else CLIP_MODEL_ID
+            )
+            head_path = local / "head_weights.pt"
+        else:
+            from huggingface_hub import hf_hub_download
+            clip_vision = CLIPVisionModel.from_pretrained(
+                model_id_or_path, subfolder="model/clip_vision"
+            )
+            head_path = hf_hub_download(
+                repo_id=model_id_or_path, filename="model/head_weights.pt"
+            )
+
+        head_data = torch.load(head_path, map_location=device, weights_only=True)
         model = cls(clip_vision)
         model.fft_branch.load_state_dict(head_data["fft_branch"])
         model.classifier.load_state_dict(head_data["classifier"])

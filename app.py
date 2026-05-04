@@ -8,7 +8,7 @@ from ultralytics import YOLO
 from transformers import CLIPVisionModel, CLIPImageProcessor
 from model import DeepfakeDetector, CLIP_MODEL_ID
 from PIL import Image
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, send_from_directory
 from flask_cors import CORS
 
 from dotenv import load_dotenv; load_dotenv()
@@ -16,22 +16,25 @@ from dotenv import load_dotenv; load_dotenv()
 app = Flask(__name__)
 CORS(app, origins="*")
 
-YOLO_FACE_PATH = "./model/yolov8n-face.pt"
+FRONTEND_DIST = Path("frontend/dist")
 YOLO_FACE_CONF = 0.35
-yolo_face = YOLO(YOLO_FACE_PATH)
-
-
-# ── Model ─────────────────────────────────────────────────────────────────────
 MODEL_DIR = Path("./model")
+MODEL_REPO = "knmrfr/deepfake-detector"
+
+# ── Model & YOLO loading ───────────────────────────────────────────────────────
 if (MODEL_DIR / "clip_vision").exists():
     print(f"Loading trained model from: {MODEL_DIR}")
+    yolo_path = str(MODEL_DIR / "yolov8n-face.pt")
     model = DeepfakeDetector.from_pretrained(MODEL_DIR)
     processor = CLIPImageProcessor.from_pretrained(MODEL_DIR)
 else:
-    print(f"No trained model found — loading base CLIP from {CLIP_MODEL_ID}")
-    clip_vision = CLIPVisionModel.from_pretrained(CLIP_MODEL_ID)
-    model = DeepfakeDetector(clip_vision)
-    processor = CLIPImageProcessor.from_pretrained(CLIP_MODEL_ID)
+    print(f"Downloading model from HF Hub: {MODEL_REPO}")
+    from huggingface_hub import hf_hub_download
+    yolo_path = hf_hub_download(repo_id=MODEL_REPO, filename="model/yolov8n-face.pt")
+    model = DeepfakeDetector.from_pretrained(MODEL_REPO)
+    processor = CLIPImageProcessor.from_pretrained(MODEL_REPO, subfolder="model")
+
+yolo_face = YOLO(yolo_path)
 model.eval()
 
 # ── Face Detection Helper ────────────────────────────────────────────────────
@@ -352,6 +355,17 @@ HTML = """
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
+    if FRONTEND_DIST.exists():
+        return send_from_directory(str(FRONTEND_DIST), "index.html")
+    return render_template_string(HTML)
+
+@app.route("/<path:path>")
+def static_proxy(path):
+    if FRONTEND_DIST.exists():
+        try:
+            return send_from_directory(str(FRONTEND_DIST), path)
+        except Exception:
+            return send_from_directory(str(FRONTEND_DIST), "index.html")
     return render_template_string(HTML)
 
 @app.route("/predict", methods=["POST"])
@@ -403,4 +417,5 @@ def predict():
     })
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5001)
+    port = int(os.getenv("PORT", 7860))
+    app.run(host="0.0.0.0", port=port)
